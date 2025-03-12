@@ -1,0 +1,48 @@
+data:
+  root_dir: "./data/WHU"  # 数据集根目录
+  input_size: 1024    # 输入尺寸
+  num_workers: 4      # 数据加载工作线程数
+
+dataset:
+  num_classes: 1      # 建筑物分割是二分类任务 (背景/建筑物)
+
+model:
+  # SAM配置
+  sam_type: "vit_h"  # 选项: vit_b, vit_l, vit_h
+  checkpoint: "sam_vit_h_4b8939.pth"
+  freeze_image_encoder: true
+  
+  # 特征聚合器配置
+  feature_layers: [0, 4, 8, 12, 16, 20, 24, 28]  # 每隔8层选择一个ViT层
+  out_channels: 32  # 输出通道数
+  
+  # 多尺度特征生成配置
+  use_transpose_conv: true  # 使用转置卷积进行上采样
+  use_max_pooling: true     # 使用最大池化进行下采样
+  
+  # 查询提示器配置
+  num_encoder_layers: 3
+  num_decoder_layers: 6
+  num_queries: 100  # 对象查询数量
+  hidden_dim: 256
+  dropout: 0.1
+  
+  # 梯度模块配置
+  use_gradient: true
+  
+  # 掩码编码器配置
+  use_coarse_mask: true
+
+training:
+  batch_size: 2
+  lr: 0.0001
+  weight_decay: 0.0001
+  epochs: 300
+  lr_drop: 200
+  
+  # 损失权重
+  loss_weights:
+    class_loss_coef: 2.0
+    mask_loss_coef: 5.0
+    dice_loss_coef: 5.0
+    prompt_loss_coef: 2.0
