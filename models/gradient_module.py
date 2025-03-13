@@ -3,32 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import kornia.filters as kf
 
-# class GradientExtractor(nn.Module):
-#     """
-#     Extracts image gradients using Sobel filter
-#     (使用Sobel滤波器提取图像梯度)
-#     """
-#     def __init__(self):
-#         super().__init__()
-        
-#     def forward(self, x):
-#         # Convert to grayscale if RGB
-#         if x.shape[1] > 1:
-#             gray = x.mean(dim=1, keepdim=True)
-#         else:
-#             gray = x
-        
-#         # Calculate gradients using Sobel filters
-#         grad_x = kf.sobel(gray, normalized=True, direction='x')
-#         grad_y = kf.sobel(gray, normalized=True, direction='y')
-        
-#         # Compute gradient magnitude
-#         grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)
-        
-#         # Stack horizontal and vertical gradients
-#         grad_features = torch.cat([grad_x, grad_y, grad_mag], dim=1)
-        
-#         return grad_features
 
 class GradientExtractor(nn.Module):
     """

@@ -13,7 +13,6 @@ import logging
 import datetime
 import math
 from skimage import measure
-import numpy as np
 
 from models.rsprompter import RSPrompter
 from utils.losses import HungarianMatcher, SetCriterion
@@ -58,6 +57,13 @@ def load_config(config_path):
     """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # 添加实例分割相关配置
+    if 'model' in config and 'per_query_mask' not in config['model']:
+        config['model']['per_query_mask'] = True  # 默认开启每查询掩码
+    if 'model' in config and 'max_queries_per_batch' not in config['model']:
+        config['model']['max_queries_per_batch'] = 10  # 默认批处理大小
+    
     return EasyDict(config)
 
 def save_checkpoint(state, is_best, checkpoint_dir, filename="checkpoint.pth"):
@@ -73,10 +79,23 @@ def save_checkpoint(state, is_best, checkpoint_dir, filename="checkpoint.pth"):
         best_path = os.path.join(checkpoint_dir, "model_best.pth")
         torch.save(state, best_path)
 
-def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, logger):
+def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, logger, accumulation_steps=4):
     """
-    Train model for one epoch
-    (训练模型一个epoch)
+    训练模型一个epoch(使用梯度累积)
+    
+    Args:
+        model: 训练的模型
+        criterion: 损失函数
+        dataloader: 训练数据加载器
+        optimizer: 优化器
+        device: 使用的设备
+        epoch: 当前epoch
+        logger: 日志记录器
+        accumulation_steps: 梯度累积步骤数
+        
+    Returns:
+        avg_loss: 平均损失
+        avg_loss_dict: 各损失组件的平均值
     """
     model.train()
     total_loss = 0
@@ -84,6 +103,8 @@ def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, logg
     
     # 使用tqdm创建进度条
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
+    
+    optimizer.zero_grad()  # 初始化梯度
     
     for i, batch in enumerate(pbar):
         # 将数据移到设备上
@@ -128,6 +149,11 @@ def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, logg
         # 汇总损失
         loss = sum(losses.values())
         
+        # 检查损失是否有效
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.warning(f"批次 {i}: 检测到无效损失 {loss}，跳过此批次")
+            continue
+            
         # 更新损失统计
         total_loss += loss.item()
         
@@ -137,10 +163,22 @@ def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, logg
                 epoch_loss_dict[k] = 0
             epoch_loss_dict[k] += v.item()
         
-        # 反向传播和优化
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # 缩放损失以匹配梯度累积
+        scaled_loss = loss / accumulation_steps
+        
+        # 反向传播
+        scaled_loss.backward()
+        
+        # 每累积足够步骤后更新参数
+        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
+            # 梯度裁剪以防止爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            # 清理缓存
+            torch.cuda.empty_cache()
         
         # 更新进度条
         pbar.set_postfix({"loss": loss.item()})
@@ -184,7 +222,6 @@ def validate(model, criterion, dataloader, device, epoch, logger):
             for idx in range(images.shape[0]):
                 binary_mask = masks[idx] > 0
                 
-                from skimage import measure
                 labeled_mask = measure.label(binary_mask.cpu().numpy())
                 unique_labels = np.unique(labeled_mask)
                 unique_labels = unique_labels[unique_labels != 0]
@@ -225,13 +262,18 @@ def validate(model, criterion, dataloader, device, epoch, logger):
                 epoch_loss_dict[k] += v.item()
             
             # 计算评估指标
-            pred_masks = outputs['pred_masks'].sigmoid() > 0.5
-            pred_classes = outputs['pred_logits'].argmax(-1)
+            pred_masks = outputs['pred_masks'].sigmoid() > 0.5  # [B, N, 1, H, W]
+            pred_classes = outputs['pred_logits'].argmax(-1)    # [B, N]
             
             for idx in range(images.shape[0]):
                 # 只考虑模型预测为建筑物的掩码
                 valid_pred_indices = (pred_classes[idx] == 0)
-                pred_instance_masks = pred_masks[idx, valid_pred_indices, 0]
+                
+                # 确保有效的形状处理
+                if len(pred_masks.shape) == 5:  # [B, N, 1, H, W]
+                    pred_instance_masks = pred_masks[idx, valid_pred_indices, 0]  # [num_valid, H, W]
+                else:  # 兼容旧版输出形状 [B, 1, H, W]
+                    pred_instance_masks = pred_masks[idx]
                 
                 # 将预测掩码合并为一个二值掩码
                 if pred_instance_masks.shape[0] > 0:
@@ -291,13 +333,18 @@ def test(model, dataloader, device, logger):
             outputs = model(images)
             
             # 预测处理
-            pred_masks = outputs['pred_masks'].sigmoid() > 0.5
-            pred_classes = outputs['pred_logits'].argmax(-1)
+            pred_masks = outputs['pred_masks'].sigmoid() > 0.5  # [B, N, 1, H, W]
+            pred_classes = outputs['pred_logits'].argmax(-1)    # [B, N]
             
             for idx in range(images.shape[0]):
                 # 只考虑模型预测为建筑物的掩码
                 valid_pred_indices = (pred_classes[idx] == 0)
-                pred_instance_masks = pred_masks[idx, valid_pred_indices, 0]
+                
+                # 确保有效的形状处理
+                if len(pred_masks.shape) == 5:  # [B, N, 1, H, W]
+                    pred_instance_masks = pred_masks[idx, valid_pred_indices, 0]  # [num_valid, H, W]
+                else:  # 兼容旧版输出形状 [B, 1, H, W]
+                    pred_instance_masks = pred_masks[idx]
                 
                 # 将预测掩码合并为一个二值掩码
                 if pred_instance_masks.shape[0] > 0:
@@ -369,29 +416,29 @@ def main(args):
     logger.info(f"总参数量: {total_params:,} (Total parameters)")
     logger.info(f"可训练参数量: {trainable_params:,} ({trainable_params/total_params*100:.2f}%) (Trainable parameters)")
     
-    # 设置损失函数
+    # 配置匹配器和损失计算器
     matcher = HungarianMatcher(
         cost_class=config.training.loss_weights.class_loss_coef,
         cost_mask=config.training.loss_weights.mask_loss_coef,
         cost_dice=config.training.loss_weights.dice_loss_coef
     )
-    
+
     weight_dict = {
         'loss_ce': config.training.loss_weights.class_loss_coef,
         'loss_mask': config.training.loss_weights.mask_loss_coef,
         'loss_dice': config.training.loss_weights.dice_loss_coef,
         'loss_prompt': config.training.loss_weights.prompt_loss_coef
     }
-    
+
     if config.model.use_coarse_mask:
         weight_dict['loss_coarse_mask'] = config.training.loss_weights.mask_loss_coef
         weight_dict['loss_coarse_dice'] = config.training.loss_weights.dice_loss_coef
-    
+
     criterion = SetCriterion(
         num_classes=config.dataset.num_classes,
         matcher=matcher,
         weight_dict=weight_dict,
-        eos_coef=0.1,
+        eos_coef=0.1,  # 背景类权重
         losses=('labels', 'masks', 'prompt')
     )
     criterion.to(device)
@@ -493,7 +540,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RSPrompter Training Script")
-    parser.add_argument('--config', type=str, default='config.yml', help='配置文件路径 (Path to config file)')
+    parser.add_argument('--config', type=str, default='config/config.yml', help='配置文件路径 (Path to config file)')
     parser.add_argument('--device', type=str, default='cuda:0', help='使用的设备 (Device to use)')
     parser.add_argument('--seed', type=int, default=42, help='随机种子 (Random seed)')
     parser.add_argument('--log-dir', type=str, default='logs', help='日志目录 (Log directory)')

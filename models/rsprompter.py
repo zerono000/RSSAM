@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from segment_anything import sam_model_registry
+import math
 
 from .aggregator import FeatureAggregator, MultiScaleGenerator
 from .prompter import QueryPrompter
@@ -55,7 +56,7 @@ class RSPrompter(nn.Module):
         # Query-based prompter
         self.prompter = QueryPrompter(
             hidden_dim=hidden_dim,
-            feature_dim=config.model.out_channels,  # 传递实际特征通道数
+            feature_dim=config.model.out_channels,
             num_queries=config.model.num_queries,
             num_classes=config.dataset.num_classes,
             num_encoder_layers=config.model.num_encoder_layers,
@@ -74,19 +75,33 @@ class RSPrompter(nn.Module):
         
         # 特征层索引
         self.feature_layers = config.model.feature_layers
-
+        
+        # 配置参数
+        self.per_query_mask = getattr(config.model, 'per_query_mask', True)
+        self.max_queries_per_batch = getattr(config.model, 'max_queries_per_batch', 10)
+        
     def _hook_fn(self, module, input, output):
         """钩子函数，用于捕获中间层特征"""
         self.intermediate_features.append(output)
     
     def forward(self, images):
+        """
+        RSPrompter的端到端前向传播
+        
+        Args:
+            images: 输入图像 [B, 3, H, W]
+            
+        Returns:
+            包含预测结果的字典：类别预测、掩码预测、提示嵌入和可选的粗略掩码
+        """
         # 保存原始图像尺寸用于后处理
         original_size = (images.shape[-2], images.shape[-1])
         input_size = original_size  # 假设不裁剪
+        
         # 清空存储的特征
         self.intermediate_features = []
         
-        # 注册钩子
+        # 注册钩子收集特征
         hooks = []
         for i, block in enumerate(self.sam.image_encoder.blocks):
             if i in self.feature_layers:
@@ -118,120 +133,113 @@ class RSPrompter(nn.Module):
             images
         )
         
-        # 处理粗掩码 - 修改这部分逻辑
-        dense_embeddings = None
-        if self.use_coarse_mask and prompter_outputs['coarse_masks'] is not None:
-            coarse_masks = prompter_outputs['coarse_masks']
-            # print(coarse_masks.shape)
-            dense_embeddings = self.mask_encoder(coarse_masks)
-            
-            # 打印形状以进行调试
-            print(f"Dense embeddings shape: {dense_embeddings.shape}")
+        # 获取类别预测和提示嵌入
+        class_logits = prompter_outputs['class_logits']  # [B, N, C]
+        prompt_embeddings = prompter_outputs['prompt_embeddings']  # [B, N, 5, 256]
+        coarse_masks = prompter_outputs['coarse_masks'] if self.use_coarse_mask else None  # [B, N, H, W]
         
-        # 获取提示嵌入
-        prompt_embeddings = prompter_outputs['prompt_embeddings']
-        
-        # 打印关键形状信息
-        print(f"Prompt embeddings shape: {prompt_embeddings.shape}")
-        
-        # 重塑提示嵌入以用于SAM
-        b, n, points, c = prompt_embeddings.shape
-        print(f"Batch size: {b}, Queries: {n}, Points per query: {points}")
-        sparse_embeddings = prompt_embeddings.reshape(b, n * points, c)
-        
-        # ----- 关键修复部分开始 -----
         # 从SAM获取位置编码
         image_pe = self.sam.prompt_encoder.get_dense_pe()
         
-        # 准备空的密集嵌入
-        if self.use_coarse_mask and 'coarse_masks' in prompter_outputs:
+        # 批次大小和查询数量
+        batch_size, num_queries = class_logits.shape[:2]
+        points_per_query = prompt_embeddings.shape[2]
+        hidden_dim = prompt_embeddings.shape[3]
+        
+        # 准备密集嵌入
+        if self.use_coarse_mask and coarse_masks is not None:
             try:
-                dense_embeddings = self.mask_encoder(prompter_outputs['coarse_masks'])
+                dense_embeddings = self.mask_encoder(coarse_masks)  # [B, 256, H, W]
             except Exception as e:
                 print(f"警告: 粗掩码编码失败 {e}, 使用零张量替代")
                 h, w = image_embeddings.shape[-2:]
-                dense_embeddings = torch.zeros((b, 1, h, w), device=image_embeddings.device)
+                dense_embeddings = torch.zeros((batch_size, hidden_dim, h, w), device=image_embeddings.device)
         else:
             # 创建空的密集嵌入
             h, w = image_embeddings.shape[-2:]
-            dense_embeddings = torch.zeros((b, 1, h, w), device=image_embeddings.device)
+            dense_embeddings = torch.zeros((batch_size, hidden_dim, h, w), device=image_embeddings.device)
         
-        # 打印掩码解码器输入的形状
-        print(f"Image embeddings: {image_embeddings.shape}")
-        print(f"Sparse embeddings: {sparse_embeddings.shape}")
-        print(f"Dense embeddings: {dense_embeddings.shape}")
+        # 设置最大前景查询数量，避免内存不足
+        max_foreground_queries = getattr(self, 'max_foreground_queries', 10)
         
-        # 运行SAM掩码解码器 - 使用稀疏嵌入的前n_per_image个
-        # 这里我们选择每张图像只使用前100个查询点
-        n_per_image = min(100, n * points)  # 限制每张图像的提示数量
+        # 为每个查询生成单独的掩码 - 内存优化版本
+        all_masks = []
         
-        all_mask_predictions = []
-        all_class_logits = []
-        
-        for i in range(b):
-            # 为每张图像处理最多n_per_image个提示
-            current_sparse = sparse_embeddings[i, :n_per_image].unsqueeze(0)  # [1, n_per_image, c]
-            current_image = image_embeddings[i:i+1]  # [1, C, H, W]
-            current_dense = dense_embeddings[i:i+1]  # [1, 1, H, W]
+        for b in range(batch_size):
+            # 预测类别，找出前景查询
+            if hasattr(self, 'memory_efficient') and self.memory_efficient:
+                # 只处理预测为前景的查询
+                foreground_queries = (class_logits[b].argmax(-1) == 0).nonzero().squeeze(-1)
+                
+                # 如果是0维张量，转为1维
+                if foreground_queries.ndim == 0 and foreground_queries.numel() == 1:
+                    foreground_queries = foreground_queries.unsqueeze(0)
+                
+                # 如果没有前景查询，使用空查询集
+                if foreground_queries.numel() == 0:
+                    query_indices = torch.tensor([], dtype=torch.long, device=class_logits.device)
+                else:
+                    # 限制处理的前景查询数量
+                    max_queries = min(foreground_queries.shape[0], max_foreground_queries)
+                    query_indices = foreground_queries[:max_queries]
+            else:
+                # 处理所有查询
+                query_indices = torch.arange(num_queries, device=class_logits.device)
             
-            # 对当前图像运行掩码解码器
-            mask_pred, _ = self.sam.mask_decoder(
-                image_embeddings=current_image,
-                image_pe=image_pe,
-                sparse_prompt_embeddings=current_sparse,
-                dense_prompt_embeddings=current_dense,
-                multimask_output=False,
-            )
-
-            # 使用SAM的后处理方法将掩码上采样到原始尺寸
-            upsampled_masks = self.sam.postprocess_masks(
-                mask_pred,
-                input_size=input_size,
-                original_size=original_size
-            )
+            # 为该批次创建掩码存储
+            batch_masks = torch.zeros((1, num_queries, 1, original_size[0], original_size[1]), 
+                                    device=images.device)
             
-            # 保存当前图像的预测和类别
-            all_mask_predictions.append(upsampled_masks)  # [1, n_per_image, 1, H, W]
+            # 如果有查询要处理
+            if len(query_indices) > 0:
+                current_image_embedding = image_embeddings[b:b+1]  # [1, 256, H, W]
+                current_dense_embedding = dense_embeddings[b:b+1]  # [1, 256, H, W]
+                
+                # 批量处理查询以节省内存 (每次处理4个查询)
+                batch_size_q = min(4, len(query_indices))
+                for i in range(0, len(query_indices), batch_size_q):
+                    end_idx = min(i + batch_size_q, len(query_indices))
+                    batch_indices = query_indices[i:end_idx]
+                    
+                    # 为批量查询生成掩码
+                    for q_idx in batch_indices:
+                        # 获取当前查询的提示嵌入
+                        current_prompt = prompt_embeddings[b, q_idx].unsqueeze(0)  # [1, 5, 256]
+                        
+                        # 运行SAM掩码解码器
+                        mask_pred, _ = self.sam.mask_decoder(
+                            image_embeddings=current_image_embedding,
+                            image_pe=image_pe,
+                            sparse_prompt_embeddings=current_prompt,
+                            dense_prompt_embeddings=current_dense_embedding,
+                            multimask_output=False,
+                        )  # [1, 1, H, W]
+                        
+                        # 将掩码上采样到原始尺寸
+                        upsampled_mask = self.sam.postprocess_masks(
+                            mask_pred,
+                            input_size=input_size,
+                            original_size=original_size
+                        )  # [1, 1, H, W]
+                        
+                        # 存储掩码
+                        batch_masks[0, q_idx] = upsampled_mask
+                        
+                        # 立即清理不需要的变量
+                        del mask_pred
+                    
+                    # 显式清理缓存
+                    if i + batch_size_q < len(query_indices):
+                        torch.cuda.empty_cache()
             
-            # 保存类别逻辑（如果需要）
-            current_class = prompter_outputs['class_logits'][i, :n_per_image//points].unsqueeze(0)
-            all_class_logits.append(current_class)
+            all_masks.append(batch_masks)
         
-        # 合并所有预测
-        if all_mask_predictions:
-            mask_predictions = torch.cat(all_mask_predictions, dim=0)  # [B, n_per_image, 1, H, W]
-            class_logits = torch.cat(all_class_logits, dim=0)  # [B, n_per_image//points, num_classes]
-            
-            # 打印实际的掩码形状
-            print(f"Raw mask_predictions shape: {mask_predictions.shape}")
-            
-            # 重新组织掩码以匹配外部预期格式 - 不要过度重塑
-            # 只保留我们能处理的实例数量
-            instances_to_keep = n_per_image // points
-            mask_predictions = mask_predictions[:, :instances_to_keep]  # [B, instances_to_keep, 1, H, W]
-        else:
-            # 创建空的掩码预测
-            mask_predictions = torch.zeros((b, 1, 1, image_embeddings.shape[-2], image_embeddings.shape[-1]), 
-                                        device=image_embeddings.device)
-            class_logits = prompter_outputs['class_logits']
-
-        # 在返回结果前调整pred_masks的形状以匹配pred_logits的批次结构
-        class_logits = prompter_outputs['class_logits']  # [B, N, C]
-        pred_masks = mask_predictions
-        
-        # 调整pred_masks以匹配class_logits的查询数量
-        B, N, C = class_logits.shape
-        if pred_masks.shape[1] != N:
-            # 如果pred_masks每个样本只有1个掩码，但class_logits有N个查询
-            # 复制掩码N次以匹配
-            pred_masks = pred_masks.repeat(1, N, 1, 1, 1)
-    
-
-        # 打印最终掩码尺寸
-        print(f"Final mask_predictions shape: {mask_predictions.shape}")
+        # 合并所有批次的掩码
+        pred_masks = torch.cat(all_masks, dim=0)  # [B, N, 1, H, W]
         
         return {
-            'pred_logits': class_logits,  # 使用与掩码匹配的类别
-            'pred_masks': mask_predictions,
-            'coarse_masks': prompter_outputs['coarse_masks'] if self.use_coarse_mask else None
+            'pred_logits': class_logits,  # [B, N, C]
+            'pred_masks': pred_masks,  # [B, N, 1, H, W]
+            'prompt_embeddings': prompt_embeddings,  # [B, N, 5, 256] 用于计算提示损失
+            'coarse_masks': coarse_masks if self.use_coarse_mask else None  # [B, N, H, W] 可选
         }

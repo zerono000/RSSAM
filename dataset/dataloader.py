@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import DataLoader, random_split
-from .whu_dataset import WHUBuildingDataset
+# from .whu_dataset import SemanticSegmentationDataset
+from .whu_dataset import SemanticSegmentationDataset
 from .transforms import Compose, Resize, RandomHorizontalFlip, RandomVerticalFlip, RandomRotation, RandomCrop, Normalize, ToTensor
 
 
@@ -56,19 +57,19 @@ def build_whu_dataloader(config):
         Dictionary containing train, val, and test data loaders
     """
     # Create datasets
-    train_dataset = WHUBuildingDataset(
+    train_dataset = SemanticSegmentationDataset(
         root_dir=config.data.root_dir,
         split='train',
         transform=get_train_transform(input_size=config.data.input_size)
     )
     
-    val_dataset = WHUBuildingDataset(
+    val_dataset = SemanticSegmentationDataset(
         root_dir=config.data.root_dir,
         split='val',
         transform=get_val_transform(input_size=config.data.input_size)
     )
     
-    test_dataset = WHUBuildingDataset(
+    test_dataset = SemanticSegmentationDataset(
         root_dir=config.data.root_dir,
         split='test',
         transform=get_test_transform(input_size=config.data.input_size)

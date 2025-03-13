@@ -1,19 +1,25 @@
 data:
   root_dir: "./data/WHU"  # 数据集根目录
   input_size: 1024    # 输入尺寸
-  num_workers: 4      # 数据加载工作线程数
+  num_workers: 5      # 数据加载工作线程数
 
 dataset:
-  num_classes: 1      # 建筑物分割是二分类任务 (背景/建筑物)
+  num_classes: 2
+  class_names: ['背景', '建筑']
 
 model:
   # SAM配置
   sam_type: "vit_h"  # 选项: vit_b, vit_l, vit_h
   checkpoint: "sam_vit_h_4b8939.pth"
   freeze_image_encoder: true
+
+  # 新增参数
+  per_query_mask: true          # 为每个查询生成独立掩码
+  max_queries_per_batch: 15    # 每批处理的最大查询数
+  memory_efficient: true  # 使用内存优化模式
   
   # 特征聚合器配置
-  feature_layers: [0, 4, 8, 12, 16, 20, 24, 28]  # 每隔8层选择一个ViT层
+  feature_layers: [0, 8, 16, 24, 31]  # 每隔4层选择一个ViT层
   out_channels: 32  # 输出通道数
   
   # 多尺度特征生成配置
@@ -21,9 +27,10 @@ model:
   use_max_pooling: true     # 使用最大池化进行下采样
   
   # 查询提示器配置
+  num_points_per_query: 3  # 每个查询的提示点数量
   num_encoder_layers: 3
   num_decoder_layers: 6
-  num_queries: 100  # 对象查询数量
+  num_queries: 15  # 对象查询数量
   hidden_dim: 256
   dropout: 0.1
   
@@ -39,6 +46,7 @@ training:
   weight_decay: 0.0001
   epochs: 300
   lr_drop: 200
+  gradient_accumulation_steps: 4
   
   # 损失权重
   loss_weights:
@@ -46,3 +54,5 @@ training:
     mask_loss_coef: 5.0
     dice_loss_coef: 5.0
     prompt_loss_coef: 2.0
+
+

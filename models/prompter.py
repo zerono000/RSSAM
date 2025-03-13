@@ -37,7 +37,7 @@ class PositionLevelEncoding(nn.Module):
             lvl_encoding = self.level_encodings[lvl_idx]
             
             # 打印形状以进行调试
-            print(f"Feature shape: {feature.shape}, Pos encoding shape: {pos_encoding.shape}")
+            # print(f"Feature shape: {feature.shape}, Pos encoding shape: {pos_encoding.shape}")
             
             # 确保维度匹配
             if pos_encoding.shape[1] != feature.shape[1]:
@@ -63,7 +63,7 @@ class QueryPrompter(nn.Module):
     (基于查询的提示器, 生成SAM兼容的提示)
     """
     def __init__(self, hidden_dim, num_queries, num_classes,
-                 feature_dim=32,  # 添加新参数，默认值为32
+                 feature_dim=32, num_points_per_query=5, # 添加新参数，默认值为32
                  num_encoder_layers=3, num_decoder_layers=6, dropout=0.1,
                  use_gradient=True):
         super().__init__()
@@ -73,6 +73,7 @@ class QueryPrompter(nn.Module):
         self.num_queries = num_queries
         self.num_classes = num_classes
         self.use_gradient = use_gradient
+        self.num_points_per_query = num_points_per_query
         
         # Position and level encoding - 使用feature_dim
         self.encoding = PositionLevelEncoding(feature_dim, num_scales=5)
@@ -118,7 +119,7 @@ class QueryPrompter(nn.Module):
         # Output heads
         self.class_head = nn.Linear(hidden_dim, num_classes + 1)  # +1 for no-object
         self.mask_head = nn.Linear(hidden_dim, hidden_dim)
-        self.prompt_head = nn.Linear(hidden_dim, hidden_dim * 5)  # 5 points per instance
+        self.prompt_head = nn.Linear(hidden_dim, hidden_dim * self.num_points_per_query)  # 5 points per instance
         
         # Initialize parameters
         self._reset_parameters()
@@ -174,7 +175,7 @@ class QueryPrompter(nn.Module):
         
         # Reshape prompt embeddings to get 5 points per instance
         b, n, _ = prompt_embeddings.shape
-        prompt_embeddings = prompt_embeddings.reshape(b, n, 5, self.hidden_dim)
+        prompt_embeddings = prompt_embeddings.reshape(b, n, self.num_points_per_query, self.hidden_dim)
         
         # Generate coarse masks using mask tokens and largest feature
         coarse_masks = self._generate_coarse_masks(mask_tokens, largest_feature)
