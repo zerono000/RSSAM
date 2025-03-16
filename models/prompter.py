@@ -63,13 +63,13 @@ class QueryPrompter(nn.Module):
     (基于查询的提示器, 生成SAM兼容的提示)
     """
     def __init__(self, hidden_dim, num_queries, num_classes,
-                 feature_dim=32, num_points_per_query=5, # 添加新参数，默认值为32
+                 feature_dim=32, num_points_per_query=5,
                  num_encoder_layers=3, num_decoder_layers=6, dropout=0.1,
                  use_gradient=True):
         super().__init__()
         
         self.hidden_dim = hidden_dim
-        self.feature_dim = feature_dim  # 保存feature_dim
+        self.feature_dim = feature_dim
         self.num_queries = num_queries
         self.num_classes = num_classes
         self.use_gradient = use_gradient

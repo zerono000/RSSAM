@@ -48,28 +48,28 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha=0.25, gamma=2):
     # 返回所有实例的平均损失
     return loss.mean(1).sum() / num_boxes
 
-class HungarianMatcher(nn.Module):
+class EnhancedHungarianMatcher(nn.Module):
     """
-    基于查询的RSPrompter匹配器，匹配预测与目标的对应关系
+    优化的匈牙利匹配器，提高匹配效率和成功率
     """
     def __init__(self, cost_class=1, cost_mask=1, cost_dice=1):
         super().__init__()
         self.cost_class = cost_class
         self.cost_mask = cost_mask
         self.cost_dice = cost_dice
+        
+        # 调试模式 - 设置为True输出更多日志
+        self.debug = False
     
     @torch.no_grad()
     def forward(self, outputs, targets):
-        """执行匈牙利匹配"""
         bs, num_queries = outputs["pred_logits"].shape[:2]
         
         # 存储所有批次的匹配索引
         indices = []
         
-        # 逐批次进行匹配
         for b in range(bs):
             # 提取当前批次的预测
-            # 类别预测 [num_queries, num_classes]
             out_prob = outputs["pred_logits"][b].softmax(-1)
             
             # 如果当前批次没有目标，添加空匹配
@@ -80,57 +80,216 @@ class HungarianMatcher(nn.Module):
                 ))
                 continue
             
-            # 提取目标类别 [num_targets]
+            # 提取目标类别
             tgt_ids = targets[b]["labels"]
             
-            # 计算类别匹配成本 [num_queries, num_targets]
+            # 计算类别匹配成本 - 关键优化点，只考虑目标中存在的类别
             cost_class = -out_prob[:, tgt_ids]
             
             # 提取掩码预测和目标
-            # 掩码预测 [num_queries, 1, H, W] 或 [num_queries, H, W]
             if outputs["pred_masks"].ndim == 5:
                 pred_masks = outputs["pred_masks"][b, :, 0]  # [num_queries, H, W]
             else:
                 pred_masks = outputs["pred_masks"][b]  # [num_queries, H, W]
             
-            # 目标掩码 [num_targets, H, W]
             tgt_masks = targets[b]["masks"]
             
             # 确保掩码形状匹配
             if pred_masks.shape[-2:] != tgt_masks.shape[-2:]:
-                # 调整预测掩码大小以匹配目标
                 pred_masks = F.interpolate(
-                    pred_masks.unsqueeze(1).float(),  # 确保浮点类型
+                    pred_masks.unsqueeze(1).float(),
                     size=tgt_masks.shape[-2:],
                     mode="bilinear",
                     align_corners=False
                 ).squeeze(1)
             
-            # 展平掩码用于BCE计算 [num_queries, H*W], [num_targets, H*W]
-            pred_masks_flat = pred_masks.flatten(1).float()  # 确保浮点类型
-            tgt_masks_flat = tgt_masks.flatten(1).float()    # 确保浮点类型
+            # 展平掩码用于更高效的计算
+            pred_masks_flat = pred_masks.flatten(1).float()
+            tgt_masks_flat = tgt_masks.flatten(1).float()
             
-            # 计算BCE成本
-            cost_mask = F.binary_cross_entropy_with_logits(
-                pred_masks_flat.unsqueeze(1).repeat(1, tgt_masks_flat.shape[0], 1),
-                tgt_masks_flat.unsqueeze(0).repeat(pred_masks_flat.shape[0], 1, 1),
-                reduction="none"
-            ).mean(dim=2)  # [num_queries, num_targets]
+            # 预先计算sigmoid，避免重复计算
+            pred_masks_sigmoid = pred_masks_flat.sigmoid()
+            
+            # 优化：批量计算BCE成本
+            # [num_queries, num_targets, H*W]
+            bce_matrix = torch.zeros((pred_masks_flat.shape[0], tgt_masks_flat.shape[0]), 
+                                     device=pred_masks_flat.device)
+            
+            # 处理尺寸问题：分批计算
+            chunk_size = min(32, pred_masks_flat.shape[0])
+            for i in range(0, pred_masks_flat.shape[0], chunk_size):
+                end_i = min(i + chunk_size, pred_masks_flat.shape[0])
+                mask_chunk = pred_masks_flat[i:end_i]
+                
+                # 分批计算BCE
+                for j in range(0, tgt_masks_flat.shape[0], chunk_size):
+                    end_j = min(j + chunk_size, tgt_masks_flat.shape[0])
+                    target_chunk = tgt_masks_flat[j:end_j]
+                    
+                    # 对每对(查询,目标)计算BCE损失
+                    for q_idx in range(end_i - i):
+                        for t_idx in range(end_j - j):
+                            bce = F.binary_cross_entropy_with_logits(
+                                mask_chunk[q_idx:q_idx+1], 
+                                target_chunk[t_idx:t_idx+1], 
+                                reduction="none"
+                            ).mean()
+                            bce_matrix[i + q_idx, j + t_idx] = bce
             
             # 计算Dice成本
+            dice_matrix = torch.zeros((pred_masks_flat.shape[0], tgt_masks_flat.shape[0]), 
+                                      device=pred_masks_flat.device)
+            
+            for i in range(0, pred_masks_sigmoid.shape[0], chunk_size):
+                end_i = min(i + chunk_size, pred_masks_sigmoid.shape[0])
+                sigmoid_chunk = pred_masks_sigmoid[i:end_i]
+                
+                for j in range(0, tgt_masks_flat.shape[0], chunk_size):
+                    end_j = min(j + chunk_size, tgt_masks_flat.shape[0])
+                    target_chunk = tgt_masks_flat[j:end_j]
+                    
+                    for q_idx in range(end_i - i):
+                        for t_idx in range(end_j - j):
+                            numerator = 2 * (sigmoid_chunk[q_idx] * target_chunk[t_idx]).sum()
+                            denominator = sigmoid_chunk[q_idx].sum() + target_chunk[t_idx].sum() + 1e-6
+                            dice_loss = 1 - numerator / denominator
+                            dice_matrix[i + q_idx, j + t_idx] = dice_loss
+            
+            # 计算总成本矩阵
+            C = (
+                self.cost_class * cost_class + 
+                self.cost_mask * bce_matrix + 
+                self.cost_dice * dice_matrix
+            )
+            
+            # 使用匈牙利算法计算最优匹配
+            C_np = C.cpu().numpy()
+            indices_np = linear_sum_assignment(C_np)
+            
+            indices.append((
+                torch.as_tensor(indices_np[0], dtype=torch.int64, device=out_prob.device),
+                torch.as_tensor(indices_np[1], dtype=torch.int64, device=out_prob.device)
+            ))
+            
+            # 调试时打印匹配情况
+            if self.debug:
+                print(f"批次 {b}: 找到 {len(indices_np[0])}/{len(tgt_ids)} 个匹配")
+                
+                # 打印匹配的类别信息
+                if len(indices_np[0]) > 0:
+                    matched_pred_classes = out_prob[indices_np[0]].argmax(-1)
+                    matched_tgt_classes = tgt_ids[indices_np[1]]
+                    
+                    correct_class_matches = (matched_pred_classes == matched_tgt_classes).sum().item()
+                    print(f"类别匹配正确率: {correct_class_matches}/{len(indices_np[0])} ({correct_class_matches/len(indices_np[0])*100:.1f}%)")
+        
+        return indices
+
+class HungarianMatcher(nn.Module):
+    """
+    基于查询的RSPrompter匹配器, 匹配预测与目标的对应关系
+    """
+    def __init__(self, cost_class=1, cost_mask=1, cost_dice=1):
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_mask = cost_mask
+        self.cost_dice = cost_dice
+    
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """执行匈牙利匹配，内存优化版本"""
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+        
+        # 存储所有批次的匹配索引
+        indices = []
+        
+        # 逐批次进行匹配
+        for b in range(bs):
+            # 提取当前批次的预测
+            out_prob = outputs["pred_logits"][b].softmax(-1)
+            
+            # 如果当前批次没有目标，添加空匹配
+            if b >= len(targets) or "labels" not in targets[b] or len(targets[b]["labels"]) == 0:
+                indices.append((
+                    torch.tensor([], dtype=torch.int64, device=out_prob.device),
+                    torch.tensor([], dtype=torch.int64, device=out_prob.device)
+                ))
+                continue
+            
+            # 提取目标类别
+            tgt_ids = targets[b]["labels"]
+            
+            # 计算类别匹配成本
+            cost_class = -out_prob[:, tgt_ids]
+            
+            # 提取掩码预测和目标
+            if outputs["pred_masks"].ndim == 5:
+                pred_masks = outputs["pred_masks"][b, :, 0]  # [num_queries, H, W]
+            else:
+                pred_masks = outputs["pred_masks"][b]  # [num_queries, H, W]
+            
+            # 目标掩码
+            tgt_masks = targets[b]["masks"]
+            
+            # 确保掩码形状匹配
+            if pred_masks.shape[-2:] != tgt_masks.shape[-2:]:
+                pred_masks = F.interpolate(
+                    pred_masks.unsqueeze(1).float(),
+                    size=tgt_masks.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                ).squeeze(1)
+            
+            # 展平掩码
+            pred_masks_flat = pred_masks.flatten(1).float()
+            tgt_masks_flat = tgt_masks.flatten(1).float()
+            
+            # 获取查询和目标数量
+            num_queries = pred_masks_flat.shape[0]
+            num_targets = tgt_masks_flat.shape[0]
+            
+            # 创建成本矩阵
+            cost_mask = torch.zeros((num_queries, num_targets), device=pred_masks_flat.device)
+            cost_dice = torch.zeros((num_queries, num_targets), device=pred_masks_flat.device)
+            
+            # 预先计算sigmoid以避免重复计算
             pred_masks_sigmoid = pred_masks_flat.sigmoid()
-            cost_dice = []
             
-            for i in range(pred_masks_flat.shape[0]):
-                dice_cost_i = []
-                for j in range(tgt_masks_flat.shape[0]):
-                    numerator = 2 * (pred_masks_sigmoid[i] * tgt_masks_flat[j]).sum()
-                    denominator = pred_masks_sigmoid[i].sum() + tgt_masks_flat[j].sum() + 1e-6
-                    dice_cost = 1 - numerator / denominator
-                    dice_cost_i.append(dice_cost)
-                cost_dice.append(torch.stack(dice_cost_i))
+            # 在小批次中计算成本以节省内存
+            batch_size = min(5, max(1, num_queries))  # 动态调整批量大小
             
-            cost_dice = torch.stack(cost_dice)  # [num_queries, num_targets]
+            for q_start in range(0, num_queries, batch_size):
+                q_end = min(q_start + batch_size, num_queries)
+                current_queries = pred_masks_flat[q_start:q_end]  # [q_batch, H*W]
+                current_sigmoid = pred_masks_sigmoid[q_start:q_end]  # [q_batch, H*W]
+                
+                for t_start in range(0, num_targets, batch_size):
+                    t_end = min(t_start + batch_size, num_targets)
+                    current_targets = tgt_masks_flat[t_start:t_end]  # [t_batch, H*W]
+                    
+                    # 计算当前批次的BCE成本
+                    for q_idx in range(q_end - q_start):
+                        q_mask = current_queries[q_idx:q_idx+1]  # [1, H*W]
+                        q_sigmoid = current_sigmoid[q_idx]  # [H*W]
+                        
+                        for t_idx in range(t_end - t_start):
+                            t_mask = current_targets[t_idx:t_idx+1]  # [1, H*W]
+                            
+                            # 计算BCE损失
+                            bce = F.binary_cross_entropy_with_logits(
+                                q_mask, t_mask, reduction="none"
+                            ).mean()
+                            
+                            # 存储BCE成本
+                            cost_mask[q_start + q_idx, t_start + t_idx] = bce
+                            
+                            # 计算Dice损失
+                            numerator = 2 * (q_sigmoid * t_mask.squeeze(0)).sum()
+                            denominator = q_sigmoid.sum() + t_mask.sum() + 1e-6
+                            dice_loss = 1 - numerator / denominator
+                            
+                            # 存储Dice成本
+                            cost_dice[q_start + q_idx, t_start + t_idx] = dice_loss
             
             # 计算总成本矩阵
             C = self.cost_class * cost_class + self.cost_mask * cost_mask + self.cost_dice * cost_dice
@@ -144,10 +303,10 @@ class HungarianMatcher(nn.Module):
             ))
         
         return indices
-
+    
 class SetCriterion(nn.Module):
     """
-    RSPrompter-query的损失计算器，包括匹配后的监督损失计算
+    RSPrompter-query的损失计算器, 包括匹配后的监督损失计算
     """
     def __init__(self, num_classes, matcher, weight_dict, eos_coef=0.1, losses=('labels', 'masks', 'prompt')):
         super().__init__()
@@ -199,7 +358,7 @@ class SetCriterion(nn.Module):
         return {'loss_ce': loss_ce}
     
     def loss_masks(self, outputs, targets, indices, num_masks):
-        """掩码损失：BCE + Dice"""
+        """掩码损失: BCE + Dice"""
         # 获取匹配的索引
         idx = self._get_src_permutation_idx(indices)
         
@@ -348,10 +507,50 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat(tgt_idx)
         return batch_idx, tgt_idx
     
+    # def forward(self, outputs, targets):
+    #     """计算总损失"""
+    #     # 执行匹配
+    #     indices = self.matcher(outputs, targets)
+        
+    #     # 计算目标掩码数量用于损失标准化
+    #     num_masks = sum(len(t["labels"]) for t in targets)
+    #     num_masks = torch.as_tensor(
+    #         [num_masks], dtype=torch.float, 
+    #         device=next(iter(outputs.values())).device
+    #     ).clamp(min=1)  # 确保不为零
+        
+    #     # 计算各种损失
+    #     losses = {}
+    #     for loss in self.losses:
+    #         loss_func = getattr(self, f"loss_{loss}")
+    #         losses.update(loss_func(outputs, targets, indices, num_masks))
+        
+    #     # 应用权重
+    #     weighted_losses = {}
+    #     for k, v in losses.items():
+    #         if k in self.weight_dict:
+    #             weighted_losses[k] = v * self.weight_dict[k]
+    #         else:
+    #             # 保留未加权的损失供调试使用
+    #             weighted_losses[k] = v
+        
+    #     return weighted_losses
+
     def forward(self, outputs, targets):
         """计算总损失"""
         # 执行匹配
         indices = self.matcher(outputs, targets)
+        
+        # 打印调试信息
+        matched_count = sum(len(src) for src, _ in indices)
+        total_targets = sum(len(t.get("labels", [])) for t in targets)
+        # print(f"匹配结果: 找到 {matched_count}/{total_targets} 个匹配对")
+        
+        # 如果没有匹配项，打印详细信息
+        if matched_count == 0 and total_targets > 0:
+            print("警告: 没有找到有效的匹配！")
+            print(f"预测类别分布: {outputs['pred_logits'].argmax(-1).flatten().tolist()[:20]}...")
+            print(f"真实类别分布: {[t['labels'].tolist() for t in targets if len(t['labels']) > 0]}")
         
         # 计算目标掩码数量用于损失标准化
         num_masks = sum(len(t["labels"]) for t in targets)
@@ -372,7 +571,6 @@ class SetCriterion(nn.Module):
             if k in self.weight_dict:
                 weighted_losses[k] = v * self.weight_dict[k]
             else:
-                # 保留未加权的损失供调试使用
                 weighted_losses[k] = v
         
         return weighted_losses

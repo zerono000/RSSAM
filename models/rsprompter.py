@@ -1,13 +1,13 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from segment_anything import sam_model_registry
-import math
 
-from .aggregator import FeatureAggregator, MultiScaleGenerator
 from .prompter import QueryPrompter
-from .gradient_module import GradientExtractor, GradientEnhancer
 from .mask_encoder import CoarseMaskEncoder
+from .aggregator import FeatureAggregator, MultiScaleGenerator
+from .gradient_module import GradientExtractor, GradientEnhancer
 
 class RSPrompter(nn.Module):
     """
@@ -21,6 +21,7 @@ class RSPrompter(nn.Module):
         self.sam = sam_model_registry[config.model.sam_type](checkpoint=config.model.checkpoint)
         
         # Freeze image encoder if specified
+        self.sam.image_encoder.eval()
         if config.model.freeze_image_encoder:
             for param in self.sam.image_encoder.parameters():
                 param.requires_grad = False
@@ -77,8 +78,15 @@ class RSPrompter(nn.Module):
         self.feature_layers = config.model.feature_layers
         
         # 配置参数
-        self.per_query_mask = getattr(config.model, 'per_query_mask', True)
-        self.max_queries_per_batch = getattr(config.model, 'max_queries_per_batch', 10)
+        # self.per_query_mask = getattr(config.model, 'per_query_mask', True)
+        # self.max_queries_per_batch = getattr(config.model, 'max_queries_per_batch', 10)
+        # 设置最大前景查询数量，避免内存不足
+        self.max_foreground_queries = getattr(config.model, 'max_foreground_queries', 10)
+        self.memory_efficient = getattr(config.model, 'memory_efficient', True)
+
+        # 如果配置了同步BN并处于分布式训练模式
+        if hasattr(config, 'distributed') and hasattr(config.distributed, 'sync_bn') and config.distributed.sync_bn:
+            self = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self)
         
     def _hook_fn(self, module, input, output):
         """钩子函数，用于捕获中间层特征"""
@@ -159,9 +167,6 @@ class RSPrompter(nn.Module):
             h, w = image_embeddings.shape[-2:]
             dense_embeddings = torch.zeros((batch_size, hidden_dim, h, w), device=image_embeddings.device)
         
-        # 设置最大前景查询数量，避免内存不足
-        max_foreground_queries = getattr(self, 'max_foreground_queries', 10)
-        
         # 为每个查询生成单独的掩码 - 内存优化版本
         all_masks = []
         
@@ -180,7 +185,7 @@ class RSPrompter(nn.Module):
                     query_indices = torch.tensor([], dtype=torch.long, device=class_logits.device)
                 else:
                     # 限制处理的前景查询数量
-                    max_queries = min(foreground_queries.shape[0], max_foreground_queries)
+                    max_queries = min(foreground_queries.shape[0], self.max_foreground_queries)
                     query_indices = foreground_queries[:max_queries]
             else:
                 # 处理所有查询

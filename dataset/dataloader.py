@@ -1,7 +1,6 @@
 import torch
 from torch.utils.data import DataLoader, random_split
-# from .whu_dataset import SemanticSegmentationDataset
-from .whu_dataset import SemanticSegmentationDataset
+from .build_dataset import SemanticSegmentationDataset
 from .transforms import Compose, Resize, RandomHorizontalFlip, RandomVerticalFlip, RandomRotation, RandomCrop, Normalize, ToTensor
 
 
@@ -45,7 +44,7 @@ def get_test_transform(input_size=1024):
     ])
 
 
-def build_whu_dataloader(config):
+def build_dataloader(config):
     """
     Build data loaders for WHU building dataset
     (为WHU建筑物数据集构建数据加载器)

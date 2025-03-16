@@ -6,28 +6,24 @@ data:
 dataset:
   num_classes: 2
   class_names: ['背景', '建筑']
+  binary_mode: true  # 可选，默认情况下num_classes=2时自动启用
 
 model:
   # SAM配置
   sam_type: "vit_h"  # 选项: vit_b, vit_l, vit_h
   checkpoint: "sam_vit_h_4b8939.pth"
   freeze_image_encoder: true
-
-  # 新增参数
-  per_query_mask: true          # 为每个查询生成独立掩码
-  max_queries_per_batch: 15    # 每批处理的最大查询数
+  # max_queries_per_batch: 15    # 每批处理的最大查询数
+  # per_query_mask: False
+  max_foreground_queries: 10
   memory_efficient: true  # 使用内存优化模式
   
   # 特征聚合器配置
   feature_layers: [0, 8, 16, 24, 31]  # 每隔4层选择一个ViT层
   out_channels: 32  # 输出通道数
   
-  # 多尺度特征生成配置
-  use_transpose_conv: true  # 使用转置卷积进行上采样
-  use_max_pooling: true     # 使用最大池化进行下采样
-  
   # 查询提示器配置
-  num_points_per_query: 3  # 每个查询的提示点数量
+  num_points_per_query: 5  # 每个查询的提示点数量
   num_encoder_layers: 3
   num_decoder_layers: 6
   num_queries: 15  # 对象查询数量
@@ -50,9 +46,19 @@ training:
   
   # 损失权重
   loss_weights:
-    class_loss_coef: 2.0
+    class_loss_coef: 5.0
     mask_loss_coef: 5.0
     dice_loss_coef: 5.0
-    prompt_loss_coef: 2.0
+    prompt_loss_coef: 1.0
+
+  ddp_optimization:
+    master_weights_only: true  # 仅在主进程保存模型权重
+    broadcast_buffers: false   # 禁用缓冲区广播以提高性能
+
+distributed:
+  sync_bn: true             # 是否使用同步批量归一化
+  find_unused_parameters: true  # 是否查找未使用的参数(用于复杂模型)
+  gradient_as_bucket_view: true # 优化内存使用
+  backend: 'nccl'           # 分布式通信后端，NVIDIA GPU推荐使用nccl
 
 
