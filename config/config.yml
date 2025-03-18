@@ -13,13 +13,10 @@ model:
   sam_type: "vit_h"  # 选项: vit_b, vit_l, vit_h
   checkpoint: "sam_vit_h_4b8939.pth"
   freeze_image_encoder: true
-  # max_queries_per_batch: 15    # 每批处理的最大查询数
-  # per_query_mask: False
-  max_foreground_queries: 10
-  memory_efficient: true  # 使用内存优化模式
+  # max_foreground_queries: 10
   
   # 特征聚合器配置
-  feature_layers: [0, 8, 16, 24, 31]  # 每隔4层选择一个ViT层
+  feature_layers: [0, 4, 8, 12, 16, 20, 24, 28, 31]  # 每隔4层选择一个ViT层
   out_channels: 32  # 输出通道数
   
   # 查询提示器配置
@@ -32,9 +29,20 @@ model:
   
   # 梯度模块配置
   use_gradient: true
-  
   # 掩码编码器配置
   use_coarse_mask: true
+
+  # 新增分割框架配置
+  segmentation_type: "semantic"  # 可选: "instance", "semantic"
+  use_mask_attention: true  # 是否使用掩码注意力机制
+  max_foreground_queries: 15
+  memory_efficient: true  # 使用内存优化模式
+  mask_attention_iterations: 2  # 掩码注意力迭代次数
+  mask_attention_threshold: 0.5  # 掩码二值化阈值
+  
+postprocessing:
+  score_threshold: 0.5  # 类别置信度阈值
+  mask_threshold: 0.5   # 掩码二值化阈值
 
 training:
   batch_size: 2

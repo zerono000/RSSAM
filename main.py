@@ -1,17 +1,18 @@
 import os
 import yaml
 import time
+import torch
+import random
 import logging
 import datetime
 import argparse
-import random
 import builtins
 import numpy as np
-import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import builtins as __builtin__
 
 from tqdm import tqdm
 from pathlib import Path
@@ -21,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from models.rsprompter import RSPrompter
-from utils.losses import HungarianMatcher, SetCriterion, EnhancedHungarianMatcher
+from utils.losses import SetCriterion, HungarianMatcher
 from dataset import build_dataloader, get_train_transform, get_val_transform, get_test_transform
 from dataset import SemanticSegmentationDataset
 
@@ -94,20 +95,113 @@ def load_config(config_path):
     
     return EasyDict(config)
 
-def save_checkpoint(state, is_best, checkpoint_dir, filename="checkpoint.pth", rank=0):
+def save_checkpoint(state, is_best, checkpoint_dir, filename="checkpoint.pth", 
+                   save_encoder=False, save_full_model=False, rank=0):
     """
     保存模型检查点 - 只在主进程中执行
+    
+    Args:
+        state: 要保存的状态字典
+        is_best: 是否是最佳模型
+        checkpoint_dir: 检查点保存目录
+        filename: 检查点文件名
+        save_encoder: 是否保存编码器权重
+        save_full_model: 是否保存完整模型
+        rank: 进程排名, 只在rank=0时保存
     """
     if rank != 0:
         return
         
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, filename)
-    torch.save(state, checkpoint_path)
     
-    if is_best:
-        best_path = os.path.join(checkpoint_dir, "model_best.pth")
-        torch.save(state, best_path)
+    # 保存可训练参数部分
+    if 'model_trainable' in state:
+        trainable_state = {
+            'epoch': state['epoch'],
+            'model': state['model_trainable'],
+            'optimizer': state['optimizer'],
+            'lr_scheduler': state['lr_scheduler'],
+            'best_iou': state['best_iou'],
+            'config': state['config']
+        }
+        
+        trainable_path = os.path.join(checkpoint_dir, filename)
+        torch.save(trainable_state, trainable_path)
+        
+        if is_best:
+            best_trainable_path = os.path.join(checkpoint_dir, "model_best.pth")
+            torch.save(trainable_state, best_trainable_path)
+            
+        print(f"可训练参数已保存到: {trainable_path}")
+    
+    # 保存完整模型（如需要）
+    if save_full_model and 'model' in state and state['model'] is not None:
+        complete_state = {
+            'epoch': state['epoch'],
+            'model': state['model'],
+            'optimizer': state['optimizer'],
+            'lr_scheduler': state['lr_scheduler'],
+            'best_iou': state['best_iou'],
+            'config': state['config']
+        }
+        
+        complete_path = os.path.join(checkpoint_dir, f"complete_{filename}")
+        torch.save(complete_state, complete_path)
+        
+        if is_best:
+            best_complete_path = os.path.join(checkpoint_dir, "model_complete_best.pth")
+            torch.save(complete_state, best_complete_path)
+            
+        print(f"完整模型已保存到: {complete_path}")
+    
+    # 保存编码器参数（如需要）
+    if save_encoder and 'model_encoder' in state and state['model_encoder'] is not None:
+        encoder_state = {
+            'model_encoder': state['model_encoder']
+        }
+        
+        encoder_path = os.path.join(checkpoint_dir, "encoder.pth")
+        torch.save(encoder_state, encoder_path)
+        print(f"编码器参数已保存到: {encoder_path}")
+
+def init_distributed_mode(args):
+    """
+    初始化分布式训练环境
+    """
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        args.rank = int(os.environ["RANK"])
+        args.world_size = int(os.environ['WORLD_SIZE'])
+        args.gpu = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        args.rank = int(os.environ['SLURM_PROCID'])
+        args.gpu = args.rank % torch.cuda.device_count()
+    else:
+        print('未检测到分布式训练环境变量，使用默认设置')
+        args.distributed = False
+        return
+
+    args.distributed = True
+
+    torch.cuda.set_device(args.gpu)
+    args.dist_backend = 'nccl'
+    print(f'| 初始化进程组: 地址={args.dist_url}, 排名={args.rank}, 全局大小={args.world_size}')
+    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                            world_size=args.world_size, rank=args.rank)
+    dist.barrier()
+    setup_for_distributed(args.rank == 0)
+
+def setup_for_distributed(is_master):
+    """
+    在分布式训练中设置打印函数，非主进程不打印
+    """
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
 
 def build_distributed_dataloader(config, distributed=False, rank=0, world_size=1):
     """
@@ -115,19 +209,19 @@ def build_distributed_dataloader(config, distributed=False, rank=0, world_size=1
     """
     # 创建数据集
     train_dataset = SemanticSegmentationDataset(
-        root_dir=config.data.root_dir,
+        config, root_dir=config.data.root_dir,
         split='train',
         transform=get_train_transform(input_size=config.data.input_size)
     )
     
     val_dataset = SemanticSegmentationDataset(
-        root_dir=config.data.root_dir,
+        config, root_dir=config.data.root_dir,
         split='val',
         transform=get_val_transform(input_size=config.data.input_size)
     )
     
     test_dataset = SemanticSegmentationDataset(
-        root_dir=config.data.root_dir,
+        config, root_dir=config.data.root_dir,
         split='test',
         transform=get_test_transform(input_size=config.data.input_size)
     )
@@ -177,6 +271,9 @@ def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, logg
     model.train()
     total_loss = 0
     epoch_loss_dict = {}
+
+    # 获取分割类型
+    segmentation_type = getattr(config_global.model, 'segmentation_type', 'instance')
     
     # 使用分布式采样器时设置当前epoch
     if distributed and hasattr(dataloader, 'sampler') and isinstance(dataloader.sampler, DistributedSampler):
@@ -206,87 +303,96 @@ def train_one_epoch(model, criterion, dataloader, optimizer, device, epoch, logg
         
         # 准备目标实例列表
         targets = []
-        
-        for idx in range(images.shape[0]):
-            # 根据处理模式选择不同的实例提取逻辑
-            if binary_mode:
-                # ---------- 二分类模式 ----------
-                # 直接使用二值掩码，背景为0，前景为1
-                binary_mask = masks[idx] > 0
-                
-                # 连通区域分析 - 找出独立实例
-                labeled_mask = measure.label(binary_mask.cpu().numpy())
-                unique_labels = np.unique(labeled_mask)
-                unique_labels = unique_labels[unique_labels != 0]  # 移除背景(0)
-                
-                # 收集所有实例掩码
-                instance_masks = []
-                instance_labels = []
-                
-                for label in unique_labels:
-                    instance_mask = torch.from_numpy(labeled_mask == label).to(device)
+
+        if segmentation_type == 'semantic':
+            # 语义分割目标准备
+            for idx in range(images.shape[0]):
+                # 对于语义分割，直接使用类别图
+                targets.append({
+                    'semantic_mask': masks[idx],  # 类别索引图
+                    'valid_pixels': masks[idx] < num_classes  # 有效像素掩码
+                })
+        else:
+            for idx in range(images.shape[0]):
+                # 根据处理模式选择不同的实例提取逻辑
+                if binary_mode:
+                    # ---------- 二分类模式 ----------
+                    # 直接使用二值掩码，背景为0，前景为1
+                    binary_mask = masks[idx] > 0
                     
-                    # 忽略太小的实例
-                    if instance_mask.sum() > 10:
-                        instance_masks.append(instance_mask)
-                        instance_labels.append(0)  # 二分类中前景类别为0
-            else:
-                # ---------- 多类别模式 ----------
-                instance_masks = []
-                instance_labels = []
-                
-                # 遍历每个有效类别 (从1开始，0是背景)
-                for class_id in range(1, num_classes):
-                    # 提取当前类别的掩码
-                    class_mask = (masks[idx] == class_id)
-                    
-                    # 如果当前类别不存在，跳过
-                    if not torch.any(class_mask):
-                        continue
-                    
-                    # 连通区域分析 - 为同一类别的不同实例创建掩码
-                    labeled_mask = measure.label(class_mask.cpu().numpy())
+                    # 连通区域分析 - 找出独立实例
+                    labeled_mask = measure.label(binary_mask.cpu().numpy())
                     unique_labels = np.unique(labeled_mask)
-                    unique_labels = unique_labels[unique_labels != 0]
+                    unique_labels = unique_labels[unique_labels != 0]  # 移除背景(0)
                     
-                    # 为每个实例创建掩码并分配类别
+                    # 收集所有实例掩码
+                    instance_masks = []
+                    instance_labels = []
+                    
                     for label in unique_labels:
                         instance_mask = torch.from_numpy(labeled_mask == label).to(device)
                         
                         # 忽略太小的实例
                         if instance_mask.sum() > 10:
                             instance_masks.append(instance_mask)
-                            instance_labels.append(class_id - 1)  # 内部表示从0开始
-            
-            # 创建目标字典
-            if len(instance_masks) == 0:
-                # 如果没有找到实例，提供空目标
-                targets.append({
-                    'labels': torch.zeros(0, dtype=torch.int64, device=device),
-                    'masks': torch.zeros((0, masks.shape[1], masks.shape[2]), 
-                                        dtype=torch.bool, device=device)
-                })
-            else:
-                # 将实例掩码堆叠为单个张量
-                masks_tensor = torch.stack(instance_masks).bool()
-                labels_tensor = torch.tensor(instance_labels, dtype=torch.int64, device=device)
-                
-                targets.append({
-                    'labels': labels_tensor,
-                    'masks': masks_tensor
-                })
-                
-                # 调试信息 (仅首批次首图像)
-                if i == 0 and idx == 0 and rank == 0:
-                    # mode_str = "二分类" if binary_mode else "多类别"
-                    # logger.info(f"[{mode_str}模式] 图像 {idx} 找到 {len(instance_masks)} 个实例")
+                            instance_labels.append(0)  # 二分类中前景类别为0
+                else:
+                    # ---------- 多类别模式 ----------
+                    instance_masks = []
+                    instance_labels = []
                     
-                    if not binary_mode and len(instance_labels) > 0:
-                        class_counts = {}
-                        for label in instance_labels:
-                            label_value = label if isinstance(label, int) else label.item()
-                            class_counts[label_value] = class_counts.get(label_value, 0) + 1
-                        logger.info(f"类别分布: {class_counts}")
+                    # 遍历每个有效类别 (从1开始，0是背景)
+                    for class_id in range(1, num_classes):
+                        # 提取当前类别的掩码
+                        class_mask = (masks[idx] == class_id)
+                        
+                        # 如果当前类别不存在，跳过
+                        if not torch.any(class_mask):
+                            continue
+                        
+                        # 连通区域分析 - 为同一类别的不同实例创建掩码
+                        labeled_mask = measure.label(class_mask.cpu().numpy())
+                        unique_labels = np.unique(labeled_mask)
+                        unique_labels = unique_labels[unique_labels != 0]
+                        
+                        # 为每个实例创建掩码并分配类别
+                        for label in unique_labels:
+                            instance_mask = torch.from_numpy(labeled_mask == label).to(device)
+                            
+                            # 忽略太小的实例
+                            if instance_mask.sum() > 10:
+                                instance_masks.append(instance_mask)
+                                instance_labels.append(class_id - 1)  # 内部表示从0开始
+                
+                # 创建目标字典
+                if len(instance_masks) == 0:
+                    # 如果没有找到实例，提供空目标
+                    targets.append({
+                        'labels': torch.zeros(0, dtype=torch.int64, device=device),
+                        'masks': torch.zeros((0, masks.shape[1], masks.shape[2]), 
+                                            dtype=torch.bool, device=device)
+                    })
+                else:
+                    # 将实例掩码堆叠为单个张量
+                    masks_tensor = torch.stack(instance_masks).bool()
+                    labels_tensor = torch.tensor(instance_labels, dtype=torch.int64, device=device)
+                    
+                    targets.append({
+                        'labels': labels_tensor,
+                        'masks': masks_tensor
+                    })
+                    
+                    # 调试信息 (仅首批次首图像)
+                    if i == 0 and idx == 0 and rank == 0:
+                        # mode_str = "二分类" if binary_mode else "多类别"
+                        # logger.info(f"[{mode_str}模式] 图像 {idx} 找到 {len(instance_masks)} 个实例")
+                        
+                        if not binary_mode and len(instance_labels) > 0:
+                            class_counts = {}
+                            for label in instance_labels:
+                                label_value = label if isinstance(label, int) else label.item()
+                                class_counts[label_value] = class_counts.get(label_value, 0) + 1
+                            logger.info(f"类别分布: {class_counts}")
         
         # 前向传播
         outputs = model(images)
@@ -365,6 +471,9 @@ def validate(model, criterion, dataloader, device, epoch, logger, distributed=Fa
     model.eval()
     total_loss = 0
     epoch_loss_dict = {}
+
+    # 获取分割类型
+    segmentation_type = getattr(config_global.model, 'segmentation_type', 'instance')
     
     # 获取处理模式和类别数
     binary_mode = config_global.dataset.binary_mode
@@ -396,58 +505,69 @@ def validate(model, criterion, dataloader, device, epoch, logger, distributed=Fa
             
             # 准备目标字典列表
             targets = []
-            for idx in range(images.shape[0]):
-                if binary_mode:
-                    # ---------- 二分类模式 ----------
-                    binary_mask = masks[idx] > 0
-                    
-                    # 连通区域分析
-                    labeled_mask = measure.label(binary_mask.cpu().numpy())
-                    unique_labels = np.unique(labeled_mask)
-                    unique_labels = unique_labels[unique_labels != 0]
-                    
-                    instance_masks = []
-                    instance_labels = []
-                    
-                    for label in unique_labels:
-                        instance_mask = torch.from_numpy(labeled_mask == label).to(device)
-                        if instance_mask.sum() > 10:
-                            instance_masks.append(instance_mask)
-                            instance_labels.append(0)  # 二分类中前景类别为0
-                else:
-                    # ---------- 多类别模式 ----------
-                    instance_masks = []
-                    instance_labels = []
-                    
-                    for class_id in range(1, num_classes):
-                        class_mask = (masks[idx] == class_id)
-                        if not torch.any(class_mask):
-                            continue
+
+            # 添加分割类型处理分支
+            if segmentation_type == 'semantic':
+                # 语义分割目标准备
+                for idx in range(images.shape[0]):
+                    # 对于语义分割，直接使用类别图
+                    targets.append({
+                        'semantic_mask': masks[idx],  # 类别索引图
+                        'valid_pixels': masks[idx] < num_classes  # 有效像素掩码
+                    })
+            else:
+                for idx in range(images.shape[0]):
+                    if binary_mode:
+                        # ---------- 二分类模式 ----------
+                        binary_mask = masks[idx] > 0
                         
-                        labeled_mask = measure.label(class_mask.cpu().numpy())
+                        # 连通区域分析
+                        labeled_mask = measure.label(binary_mask.cpu().numpy())
                         unique_labels = np.unique(labeled_mask)
                         unique_labels = unique_labels[unique_labels != 0]
+                        
+                        instance_masks = []
+                        instance_labels = []
                         
                         for label in unique_labels:
                             instance_mask = torch.from_numpy(labeled_mask == label).to(device)
                             if instance_mask.sum() > 10:
                                 instance_masks.append(instance_mask)
-                                instance_labels.append(class_id - 1)
-                
-                if len(instance_masks) == 0:
-                    targets.append({
-                        'labels': torch.zeros(0, dtype=torch.int64, device=device),
-                        'masks': torch.zeros((0, masks.shape[1], masks.shape[2]), 
-                                          dtype=torch.bool, device=device)
-                    })
-                else:
-                    masks_tensor = torch.stack(instance_masks).bool()
-                    labels_tensor = torch.tensor(instance_labels, dtype=torch.int64, device=device)
+                                instance_labels.append(0)  # 二分类中前景类别为0
+                    else:
+                        # ---------- 多类别模式 ----------
+                        instance_masks = []
+                        instance_labels = []
+                        
+                        for class_id in range(1, num_classes):
+                            class_mask = (masks[idx] == class_id)
+                            if not torch.any(class_mask):
+                                continue
+                            
+                            labeled_mask = measure.label(class_mask.cpu().numpy())
+                            unique_labels = np.unique(labeled_mask)
+                            unique_labels = unique_labels[unique_labels != 0]
+                            
+                            for label in unique_labels:
+                                instance_mask = torch.from_numpy(labeled_mask == label).to(device)
+                                if instance_mask.sum() > 10:
+                                    instance_masks.append(instance_mask)
+                                    instance_labels.append(class_id - 1)
                     
-                    targets.append({
-                        'labels': labels_tensor,
-                        'masks': masks_tensor
-                    })
+                    if len(instance_masks) == 0:
+                        targets.append({
+                            'labels': torch.zeros(0, dtype=torch.int64, device=device),
+                            'masks': torch.zeros((0, masks.shape[1], masks.shape[2]), 
+                                            dtype=torch.bool, device=device)
+                        })
+                    else:
+                        masks_tensor = torch.stack(instance_masks).bool()
+                        labels_tensor = torch.tensor(instance_labels, dtype=torch.int64, device=device)
+                        
+                        targets.append({
+                            'labels': labels_tensor,
+                            'masks': masks_tensor
+                        })
             
             # 前向传播
             outputs = model(images)
@@ -753,45 +873,7 @@ def test(model, dataloader, device, logger, distributed=False, rank=0):
         
         return mean_iou, mean_dice
 
-def init_distributed_mode(args):
-    """
-    初始化分布式训练环境
-    """
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ['WORLD_SIZE'])
-        args.gpu = int(os.environ['LOCAL_RANK'])
-    elif 'SLURM_PROCID' in os.environ:
-        args.rank = int(os.environ['SLURM_PROCID'])
-        args.gpu = args.rank % torch.cuda.device_count()
-    else:
-        print('未检测到分布式训练环境变量，使用默认设置')
-        args.distributed = False
-        return
 
-    args.distributed = True
-
-    torch.cuda.set_device(args.gpu)
-    args.dist_backend = 'nccl'
-    print(f'| 初始化进程组: 地址={args.dist_url}, 排名={args.rank}, 全局大小={args.world_size}')
-    dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                            world_size=args.world_size, rank=args.rank)
-    dist.barrier()
-    setup_for_distributed(args.rank == 0)
-
-def setup_for_distributed(is_master):
-    """
-    在分布式训练中设置打印函数，非主进程不打印
-    """
-    import builtins as __builtin__
-    builtin_print = __builtin__.print
-
-    def print(*args, **kwargs):
-        force = kwargs.pop('force', False)
-        if is_master or force:
-            builtin_print(*args, **kwargs)
-
-    __builtin__.print = print
 
 def main(args):
     """
@@ -831,6 +913,12 @@ def main(args):
     
     if rank == 0:
         logger.info(f"使用设备: {device} (Using device)")
+
+    # 加载配置后添加
+    if args.segmentation_type is not None:
+        config.model.segmentation_type = args.segmentation_type
+        if rank == 0:
+            logger.info(f"使用命令行指定的分割类型: {args.segmentation_type}")
     
     # 设置随机种子以确保可重现性
     if args.seed is not None:
@@ -896,16 +984,9 @@ def main(args):
         
         logger.info(f"总参数量: {total_params:,} (Total parameters)")
         logger.info(f"可训练参数量: {trainable_params:,} ({trainable_params/total_params*100:.2f}%) (Trainable parameters)")
-    
-    # # 配置匹配器和损失计算器
-    # matcher = HungarianMatcher(
-    #     cost_class=config.training.loss_weights.class_loss_coef,
-    #     cost_mask=config.training.loss_weights.mask_loss_coef,
-    #     cost_dice=config.training.loss_weights.dice_loss_coef
-    # )
 
     # 配置匹配器和损失计算器
-    matcher = EnhancedHungarianMatcher(
+    matcher = HungarianMatcher(
         cost_class=config.training.loss_weights.class_loss_coef,
         cost_mask=config.training.loss_weights.mask_loss_coef,
         cost_dice=config.training.loss_weights.dice_loss_coef
@@ -944,7 +1025,7 @@ def main(args):
         step_size=config.training.lr_drop,
         gamma=0.1
     )
-    
+
     # 恢复检查点（如果存在）
     start_epoch = 0
     best_iou = 0
@@ -955,18 +1036,25 @@ def main(args):
             
             # 加载到CPU以避免GPU内存问题
             checkpoint = torch.load(args.resume, map_location='cpu')
-            start_epoch = checkpoint['epoch'] + 1
-            best_iou = checkpoint['best_iou']
+            
+            # 读取训练状态
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1
+            if 'best_iou' in checkpoint:
+                best_iou = checkpoint['best_iou']
             
             # 加载模型权重
             if args.distributed:
-                # DDP模型需要加载到module
-                model.module.load_state_dict(checkpoint['model'])
+                # 使用分离的权重加载
+                model.module.load_weights(args.resume, args.encoder_weights)
             else:
-                model.load_state_dict(checkpoint['model'])
+                model.load_weights(args.resume, args.encoder_weights)
                 
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            # 加载优化器和学习率调度器状态
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            if 'lr_scheduler' in checkpoint:
+                lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
             
             if rank == 0:
                 logger.info(f"成功加载检查点, 从epoch {start_epoch}继续训练 (Resuming from epoch)")
@@ -1008,17 +1096,27 @@ def main(args):
         # 保存检查点 - 只在主进程
         is_best = val_iou > best_iou
         best_iou = max(val_iou, best_iou)
-        
+
+        # 在训练循环内部保存检查点部分
         if args.distributed:
-            # 使用DDP时，保存module的状态
-            model_state = model.module.state_dict()
+            # 使用DDP时，获取基础模型
+            model_module = model.module
         else:
-            model_state = model.state_dict()
-            
+            model_module = model    
+
+        # 分离可训练参数和编码器参数
+        trainable_state_dict, encoder_state_dict = model_module.get_trainable_and_encoder_state_dict()
+
+        # 判断是否需要保存编码器参数
+        save_encoder = (epoch == 0 and args.save_encoder_once) or args.save_full_model
+
+        # 保存检查点
         save_checkpoint(
             {
                 'epoch': epoch,
-                'model': model_state,
+                'model_trainable': trainable_state_dict,
+                'model_encoder': encoder_state_dict if save_encoder else None,
+                'model': model_module.state_dict() if args.save_full_model else None,
                 'optimizer': optimizer.state_dict(),
                 'lr_scheduler': lr_scheduler.state_dict(),
                 'best_iou': best_iou,
@@ -1027,6 +1125,8 @@ def main(args):
             is_best,
             args.checkpoint_dir,
             filename=f"checkpoint_epoch_{epoch}.pth",
+            save_encoder=save_encoder,
+            save_full_model=args.save_full_model,
             rank=rank
         )
         
@@ -1042,29 +1142,29 @@ def main(args):
         if rank == 0:
             epoch_time = time.time() - epoch_start_time
             logger.info(f"Epoch {epoch} 耗时: {epoch_time:.2f}秒 (Epoch time)")
-    
-    # 加载最佳模型进行测试 - 只在主进程或所有进程同步
+
+    # 加载最佳模型进行测试
     if rank == 0:
         logger.info("加载最佳模型进行测试... (Loading best model for testing...)")
         
-    best_model_path = os.path.join(args.checkpoint_dir, "model_best.pth")
-    
+    best_model_path = os.path.join(args.checkpoint_dir, "model_trainable_best.pth")
+    encoder_path = os.path.join(args.checkpoint_dir, "encoder.pth")
+
     # 等待所有进程
     if args.distributed:
         dist.barrier()
         
     if os.path.exists(best_model_path):
-        # 加载到CPU以避免GPU内存问题
-        checkpoint = torch.load(best_model_path, map_location='cpu')
-        
-        # 加载模型权重
+        # 使用分离的权重加载
         if args.distributed:
-            model.module.load_state_dict(checkpoint['model'])
+            model.module.load_weights(best_model_path, 
+                                    encoder_path if os.path.exists(encoder_path) else None)
         else:
-            model.load_state_dict(checkpoint['model'])
+            model.load_weights(best_model_path, 
+                            encoder_path if os.path.exists(encoder_path) else None)
             
         if rank == 0:
-            logger.info(f"成功加载最佳模型, IoU: {checkpoint['best_iou']:.4f} (Best model loaded)")
+            logger.info(f"成功加载最佳模型 (Best model loaded)")
         
         # 等待所有进程
         if args.distributed:
@@ -1103,7 +1203,11 @@ if __name__ == "__main__":
     parser.add_argument('--distributed', action='store_true', help='启用分布式训练 (Enable distributed training)')
     parser.add_argument('--world-size', type=int, default=1, help='分布式训练的进程数 (Number of processes for distributed training)')
     parser.add_argument('--dist-url', default='env://', help='分布式训练的URL (URL for distributed training)')
-    
+
+    parser.add_argument('--save-full-model', action='store_true', help='每个epoch保存完整模型 (Save full model at each epoch)')
+    parser.add_argument('--save-encoder-once', action='store_true', help='仅在首个epoch保存编码器 (Save encoder only at first epoch)')
+    parser.add_argument('--segmentation-type', type=str, default=None, choices=['instance', 'semantic'], help='分割类型，覆盖配置文件设置 (instance 或 semantic)')
+
     args = parser.parse_args()
     
     # 判断是否需要启用分布式训练

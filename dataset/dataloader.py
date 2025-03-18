@@ -55,6 +55,9 @@ def build_dataloader(config):
     Returns:
         Dictionary containing train, val, and test data loaders
     """
+    # 获取配置中的分割类型
+    segmentation_type = getattr(config.model, 'segmentation_type', 'instance')
+
     # Create datasets
     train_dataset = SemanticSegmentationDataset(
         root_dir=config.data.root_dir,
@@ -98,6 +101,11 @@ def build_dataloader(config):
         num_workers=config.data.num_workers,
         pin_memory=True
     )
+    
+    # 设置数据集的分割类型
+    train_dataset.segmentation_type = segmentation_type
+    val_dataset.segmentation_type = segmentation_type
+    test_dataset.segmentation_type = segmentation_type
     
     return {
         'train': train_loader,

@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
 
+from .mask_attention import MaskAttention
+
 
 class PositionLevelEncoding(nn.Module):
     """
@@ -65,7 +67,7 @@ class QueryPrompter(nn.Module):
     def __init__(self, hidden_dim, num_queries, num_classes,
                  feature_dim=32, num_points_per_query=5,
                  num_encoder_layers=3, num_decoder_layers=6, dropout=0.1,
-                 use_gradient=True):
+                 use_gradient=True, use_mask_attention=True):
         super().__init__()
         
         self.hidden_dim = hidden_dim
@@ -74,6 +76,7 @@ class QueryPrompter(nn.Module):
         self.num_classes = num_classes
         self.use_gradient = use_gradient
         self.num_points_per_query = num_points_per_query
+        self.use_mask_attention = use_mask_attention
         
         # Position and level encoding - 使用feature_dim
         self.encoding = PositionLevelEncoding(feature_dim, num_scales=5)
@@ -120,13 +123,26 @@ class QueryPrompter(nn.Module):
         self.class_head = nn.Linear(hidden_dim, num_classes + 1)  # +1 for no-object
         self.mask_head = nn.Linear(hidden_dim, hidden_dim)
         self.prompt_head = nn.Linear(hidden_dim, hidden_dim * self.num_points_per_query)  # 5 points per instance
+
+        # 添加掩码注意力相关组件
+        if use_mask_attention:
+            self.mask_attention = MaskAttention(hidden_dim, num_heads=8, dropout=dropout)
+            # 添加用于生成注意力掩码的投影层
+            self.mask_projector = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.ReLU(),
+                nn.Linear(hidden_dim // 2, 1)
+            )
+        else:
+            self.mask_attention = None
+            self.mask_projector = None
         
         # Initialize parameters
         self._reset_parameters()
     
     def _reset_parameters(self):
-        """Initialize weights
-        (初始化权重)
+        """
+        Initialize weights
         """
         for p in self.parameters():
             if p.dim() > 1:
@@ -160,9 +176,50 @@ class QueryPrompter(nn.Module):
         batch_size = memory.shape[0]
         query_embed = self.query_embed.unsqueeze(0).repeat(batch_size, 1, 1)  # [B, N, C]
         
-        # Apply transformer decoder
-        decoder_output = self.transformer_decoder(query_embed, memory)
-        
+        if self.use_mask_attention and self.mask_attention is not None:
+            # 步骤1: 使用标准Transformer解码器获取初始输出
+            initial_output = self.transformer_decoder(query_embed, memory)
+            
+            # 步骤2: 基于初始输出直接计算注意力掩码
+            batch_size, num_queries, _ = initial_output.shape
+            seq_len = memory.shape[1]
+            
+            # 计算查询与内存之间的相似度作为注意力掩码
+            # [B, N, C] @ [B, C, L] -> [B, N, L]
+            attention_mask = torch.bmm(
+                initial_output, 
+                memory.transpose(1, 2)
+            )
+            
+            # 将相似度转换为二值掩码
+            attention_mask = (attention_mask.sigmoid() > 0.5)  # [B, N, L]
+            
+            # 增强掩码强度
+            enhanced_memory = memory
+            
+            # 步骤3: 应用掩码注意力机制
+            decoder_output = initial_output
+            for _ in range(2):  # 减少迭代次数以提高稳定性
+                # 应用掩码注意力
+                decoder_output = self.mask_attention(
+                    query=decoder_output,
+                    key=enhanced_memory,
+                    value=enhanced_memory,
+                    attention_mask=attention_mask
+                )
+                
+                # 更新注意力掩码（可选）
+                if _ < 1:  # 只在第一次迭代后更新
+                    # 重新计算掩码，使用改进的查询
+                    attention_mask = torch.bmm(
+                        decoder_output, 
+                        memory.transpose(1, 2)
+                    )
+                    attention_mask = (attention_mask.sigmoid() > 0.5)
+        else:
+            # 使用标准Transformer解码器
+            decoder_output = self.transformer_decoder(query_embed, memory)
+                    
         # Apply gradient enhancement if enabled
         if self.use_gradient and gradient_module is not None and original_image is not None:
             gradient_features = gradient_module[0](original_image)
